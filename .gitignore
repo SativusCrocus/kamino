@@ -1,0 +1,18 @@
+# Secrets
+.env
+
+# Runtime state & logs
+reaper_state.json
+reaper.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
