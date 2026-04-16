@@ -43,10 +43,18 @@ MIGRATION_COST_USD    = 0.02         # Conservative gas cost per migration
 DAYS_TO_BREAK_EVEN    = 7            # Must recoup gas within 7 days
 MIN_POSITION_USD      = 1.0          # Don't touch tiny positions
 MAX_SLIPPAGE_BPS      = 100          # 1% max slippage for swaps
-SOL_RESERVE_LAMPORTS  = 10_000_000   # Keep 0.01 SOL for gas, never deposit all
+SOL_RESERVE_LAMPORTS  = 50_000_000   # Keep 0.05 SOL for gas + account creation rent
 
 KAMINO_API            = "https://api.kamino.finance"
+KAMINO_KTX            = "https://api.kamino.finance/ktx"
 HELIUS_RPC            = os.getenv("HELIUS_RPC", "https://api.mainnet-beta.solana.com")
+
+# Kamino lending markets to scan (mainnet)
+KAMINO_MARKETS = [
+    "DxXdAyU3kCjnyggvHmY5nAwg5cRbbmdyX3npfDMjjMek",   # JLP Market
+    "H6rHXmXoCQvq8Ue81MqNh7ow5ysPa1dSozwW3PU1dDH6",   # Main Market (SOL lending)
+    "ByYiZxp8QrdN9qbdtaAiePN8AAr3qvTPppNJDpf5DVJ5",   # Altcoin Market
+]
 
 LOG_FILE              = "reaper.log"
 PRICE_CACHE_SECS      = 120
@@ -74,17 +82,22 @@ class Vault:
     tvl_usd: float
     utilization: float
     risk_score: float
+    vault_type: str = "strategy"  # "strategy" (kvault) or "reserve" (klend)
+    market: str = ""              # klend market address (for reserves)
 
 @dataclass
 class State:
     current_vault: Optional[str]   = None
+    current_vault_type: str        = ""    # "strategy" or "reserve"
+    current_vault_market: str      = ""    # klend market (if reserve)
+    current_vault_name: str        = ""
     current_apy: float             = 0.0
     position_usd: float            = 0.0
     total_earned_usd: float        = 0.0
     migrations: int                = 0
     started_at: float              = field(default_factory=time.time)
     last_check: float              = 0.0
-    mode: str                      = "monitor"  # "monitor" or "auto"
+    mode: str                      = "monitor"
 
 # ─── WALLET / KEYPAIR ────────────────────────────────────────────────────────
 
@@ -178,59 +191,69 @@ async def confirm_transaction(client: httpx.AsyncClient, signature: str, timeout
 
 # ─── KAMINO TRANSACTION BUILDER ──────────────────────────────────────────────
 
+async def _sign_kamino_tx(client: httpx.AsyncClient, raw_tx: bytes) -> Optional[bytes]:
+    """Deserialize a Kamino transaction and sign it."""
+    kp = get_keypair()
+    if not kp:
+        return None
+    try:
+        from solders.transaction import VersionedTransaction
+
+        # The KTX API returns a transaction with a recent blockhash already set.
+        # We just need to sign it with our keypair.
+        tx = VersionedTransaction.from_bytes(raw_tx)
+        signed_tx = VersionedTransaction(tx.message, [kp])
+        return bytes(signed_tx)
+    except Exception as e:
+        log.error(f"Failed to sign tx: {e}")
+        return None
+
+
 async def build_kamino_deposit_tx(
     client: httpx.AsyncClient,
-    vault_address: str,
-    amount_lamports: int,
+    vault: "Vault",
+    amount: str,
 ) -> Optional[bytes]:
     """
-    Build a Kamino vault deposit transaction.
-    Uses Kamino's API to get instruction data, then signs locally.
+    Build a Kamino deposit transaction via the /ktx/ API.
+    Handles both strategy (kvault) and reserve (klend) deposits.
     """
     kp = get_keypair()
     if not kp:
         return None
 
     try:
-        from solders.transaction import VersionedTransaction
-        from solders.message import MessageV0
-        from solders.hash import Hash
+        if vault.vault_type == "reserve":
+            # klend deposit
+            r = await client.post(
+                f"{KAMINO_KTX}/klend/deposit",
+                json={
+                    "wallet": str(kp.pubkey()),
+                    "market": vault.market,
+                    "reserve": vault.address,
+                    "amount": amount,
+                },
+                timeout=20,
+            )
+        else:
+            # kvault deposit
+            r = await client.post(
+                f"{KAMINO_KTX}/kvault/deposit",
+                json={
+                    "wallet": str(kp.pubkey()),
+                    "kvault": vault.address,
+                    "amount": amount,
+                },
+                timeout=20,
+            )
 
-        # Ask Kamino API for a deposit transaction
-        r = await client.get(
-            f"{KAMINO_API}/v2/strategies/{vault_address}/deposit",
-            params={
-                "owner": str(kp.pubkey()),
-                "amount": str(amount_lamports),
-                "slippageBps": str(MAX_SLIPPAGE_BPS),
-            },
-            timeout=20,
-        )
         r.raise_for_status()
         tx_data = r.json()
-
-        # Kamino returns a base64-encoded transaction to sign
         raw_tx = base64.b64decode(tx_data.get("transaction", ""))
         if not raw_tx:
-            log.warning("Kamino API returned empty transaction")
+            log.warning("Kamino API returned empty deposit transaction")
             return None
-
-        # Deserialize, re-sign with our keypair, and return
-        tx = VersionedTransaction.from_bytes(raw_tx)
-
-        # Get fresh blockhash
-        blockhash = await get_recent_blockhash(client)
-        msg = tx.message
-        # Reconstruct with fresh blockhash
-        new_msg = MessageV0(
-            header=msg.header,
-            account_keys=list(msg.account_keys),
-            recent_blockhash=Hash.from_string(blockhash),
-            instructions=list(msg.instructions),
-            address_table_lookups=list(msg.address_table_lookups),
-        )
-        signed_tx = VersionedTransaction(new_msg, [kp])
-        return bytes(signed_tx)
+        return await _sign_kamino_tx(client, raw_tx)
 
     except httpx.HTTPStatusError as e:
         log.warning(f"Kamino deposit API error ({e.response.status_code}): {e.response.text[:200]}")
@@ -242,50 +265,47 @@ async def build_kamino_deposit_tx(
 
 async def build_kamino_withdraw_tx(
     client: httpx.AsyncClient,
-    vault_address: str,
-    amount_lamports: int,
+    vault: "Vault",
+    amount: str,
 ) -> Optional[bytes]:
     """
-    Build a Kamino vault withdraw transaction.
+    Build a Kamino withdraw transaction via the /ktx/ API.
+    Use amount="18446744073709551615" (U64::MAX) to withdraw all.
     """
     kp = get_keypair()
     if not kp:
         return None
 
     try:
-        from solders.transaction import VersionedTransaction
-        from solders.message import MessageV0
-        from solders.hash import Hash
+        if vault.vault_type == "reserve":
+            r = await client.post(
+                f"{KAMINO_KTX}/klend/withdraw",
+                json={
+                    "wallet": str(kp.pubkey()),
+                    "market": vault.market,
+                    "reserve": vault.address,
+                    "amount": amount,
+                },
+                timeout=20,
+            )
+        else:
+            r = await client.post(
+                f"{KAMINO_KTX}/kvault/withdraw",
+                json={
+                    "wallet": str(kp.pubkey()),
+                    "kvault": vault.address,
+                    "amount": amount,
+                },
+                timeout=20,
+            )
 
-        r = await client.get(
-            f"{KAMINO_API}/v2/strategies/{vault_address}/withdraw",
-            params={
-                "owner": str(kp.pubkey()),
-                "amount": str(amount_lamports),
-                "slippageBps": str(MAX_SLIPPAGE_BPS),
-            },
-            timeout=20,
-        )
         r.raise_for_status()
         tx_data = r.json()
-
         raw_tx = base64.b64decode(tx_data.get("transaction", ""))
         if not raw_tx:
             log.warning("Kamino API returned empty withdraw transaction")
             return None
-
-        tx = VersionedTransaction.from_bytes(raw_tx)
-        blockhash = await get_recent_blockhash(client)
-        msg = tx.message
-        new_msg = MessageV0(
-            header=msg.header,
-            account_keys=list(msg.account_keys),
-            recent_blockhash=Hash.from_string(blockhash),
-            instructions=list(msg.instructions),
-            address_table_lookups=list(msg.address_table_lookups),
-        )
-        signed_tx = VersionedTransaction(new_msg, [kp])
-        return bytes(signed_tx)
+        return await _sign_kamino_tx(client, raw_tx)
 
     except httpx.HTTPStatusError as e:
         log.warning(f"Kamino withdraw API error ({e.response.status_code}): {e.response.text[:200]}")
@@ -298,24 +318,27 @@ async def build_kamino_withdraw_tx(
 
 async def execute_migration(
     client: httpx.AsyncClient,
-    from_vault: str,
-    to_vault: str,
-    position_lamports: int,
+    from_vault: Vault,
+    to_vault: Vault,
 ) -> bool:
     """
     Execute a full vault migration: withdraw from old → deposit into new.
     Returns True if successful.
     """
-    log.info(f"AUTO-EXECUTE: Starting migration {from_vault[:12]}... → {to_vault[:12]}...")
+    log.info(f"AUTO-EXECUTE: Migrating {from_vault.name} → {to_vault.name}")
 
-    # Step 1: Withdraw from current vault
+    # Step 1: Withdraw all from current vault (U64::MAX = withdraw everything)
     log.info("Step 1/2: Withdrawing from current vault...")
-    withdraw_tx = await build_kamino_withdraw_tx(client, from_vault, position_lamports)
+    withdraw_tx = await build_kamino_withdraw_tx(client, from_vault, "18446744073709551615")
     if not withdraw_tx:
         log.error("Failed to build withdraw transaction. Aborting migration.")
         return False
 
-    withdraw_sig = await send_transaction(client, withdraw_tx)
+    try:
+        withdraw_sig = await send_transaction(client, withdraw_tx)
+    except Exception as e:
+        log.error(f"Withdraw transaction failed: {e}")
+        return False
     if not withdraw_sig:
         log.error("Failed to submit withdraw transaction.")
         return False
@@ -332,18 +355,22 @@ async def execute_migration(
     # Step 2: Get updated balance and deposit into new vault
     log.info("Step 2/2: Depositing into new vault...")
     balance = await get_sol_balance(client)
-    deposit_amount = max(0, balance - SOL_RESERVE_LAMPORTS)  # Keep gas reserve
+    deposit_amount = max(0, balance - SOL_RESERVE_LAMPORTS)
 
     if deposit_amount <= 0:
         log.warning("No balance available after withdrawal. Migration incomplete.")
         return False
 
-    deposit_tx = await build_kamino_deposit_tx(client, to_vault, deposit_amount)
+    deposit_tx = await build_kamino_deposit_tx(client, to_vault, f"{deposit_amount / 1e9:.9f}")
     if not deposit_tx:
         log.error("Failed to build deposit transaction. Funds are in wallet — not lost.")
         return False
 
-    deposit_sig = await send_transaction(client, deposit_tx)
+    try:
+        deposit_sig = await send_transaction(client, deposit_tx)
+    except Exception as e:
+        log.error(f"Deposit transaction failed: {e}. Funds are in wallet.")
+        return False
     if not deposit_sig:
         log.error("Failed to submit deposit transaction. Funds are in wallet.")
         return False
@@ -358,9 +385,9 @@ async def execute_migration(
     return True
 
 
-async def execute_initial_deposit(client: httpx.AsyncClient, vault_address: str) -> bool:
+async def execute_initial_deposit(client: httpx.AsyncClient, vault: Vault) -> bool:
     """Execute the first deposit into a Kamino vault."""
-    log.info(f"AUTO-EXECUTE: Initial deposit into {vault_address[:16]}...")
+    log.info(f"AUTO-EXECUTE: Initial deposit into {vault.name} ({vault.address[:16]}...)")
 
     balance = await get_sol_balance(client)
     deposit_amount = max(0, balance - SOL_RESERVE_LAMPORTS)
@@ -369,14 +396,20 @@ async def execute_initial_deposit(client: httpx.AsyncClient, vault_address: str)
         log.warning(f"Balance too low for deposit ({balance} lamports). Need > {SOL_RESERVE_LAMPORTS}")
         return False
 
-    log.info(f"Depositing {deposit_amount / 1e9:.6f} SOL (keeping {SOL_RESERVE_LAMPORTS / 1e9} SOL for gas)")
+    sol_amount = deposit_amount / 1e9
+    log.info(f"Depositing {sol_amount:.6f} SOL (keeping {SOL_RESERVE_LAMPORTS / 1e9} SOL for gas)")
 
-    deposit_tx = await build_kamino_deposit_tx(client, vault_address, deposit_amount)
+    # Kamino KTX expects amount as decimal string (in token units, not lamports)
+    deposit_tx = await build_kamino_deposit_tx(client, vault, f"{sol_amount:.9f}")
     if not deposit_tx:
         log.error("Failed to build deposit transaction.")
         return False
 
-    sig = await send_transaction(client, deposit_tx)
+    try:
+        sig = await send_transaction(client, deposit_tx)
+    except Exception as e:
+        log.error(f"Deposit transaction failed: {e}")
+        return False
     if not sig:
         log.error("Failed to submit deposit transaction.")
         return False
@@ -394,54 +427,114 @@ async def execute_initial_deposit(client: httpx.AsyncClient, vault_address: str)
 
 async def fetch_kamino_vaults(client: httpx.AsyncClient) -> list[Vault]:
     """
-    Fetch all Kamino lending vaults and compute risk-adjusted APY.
-    Only returns vaults for safe assets.
+    Fetch Kamino strategies (liquidity vaults) and lending reserves.
+    Only returns vaults for safe assets with meaningful TVL.
     """
-    SAFE_TOKENS = {"SOL", "mSOL", "jitoSOL", "USDC", "bSOL"}
+    # Assets to track (SOL-related for strategies, stables for lending)
+    SAFE_TOKENS = {"SOL", "MSOL", "JITOSOL", "BSOL", "USDC", "USDT"}
+    vaults = []
 
+    # ─── Source 1: Liquidity strategies (kvaults) ─────────────────────────
     try:
-        r = await client.get(f"{KAMINO_API}/v2/strategies", timeout=15)
+        r = await client.get(
+            f"{KAMINO_API}/strategies/metrics",
+            params={"env": "mainnet-beta", "status": "LIVE"},
+            timeout=20,
+        )
         r.raise_for_status()
         raw = r.json()
+
+        for item in raw:
+            try:
+                token_a = (item.get("tokenA") or "").upper()
+                token_b = (item.get("tokenB") or "").upper()
+                has_safe = token_a in SAFE_TOKENS or token_b in SAFE_TOKENS
+                if not has_safe:
+                    continue
+
+                tvl = float(item.get("totalValueLocked") or 0)
+                if tvl < 50_000:
+                    continue
+
+                # Get best available APY (prefer 7d, fall back to 24h)
+                kamino_apy = item.get("kaminoApy", {}).get("vault", {})
+                apy_7d = float(kamino_apy.get("apy7d") or kamino_apy.get("apy24d") or 0)
+                if apy_7d <= 0:
+                    apy_vault = item.get("apy", {}).get("vault", {})
+                    apy_7d = float(apy_vault.get("totalApy") or 0)
+                if apy_7d <= 0:
+                    continue
+
+                apy_pct = apy_7d * 100 if apy_7d < 1 else apy_7d  # normalize to %
+
+                address = item.get("strategy", "")
+                token_label = f"{item.get('tokenA','')}-{item.get('tokenB','')}"
+                name = f"{token_label} vault"
+
+                # Risk: penalize very high APY (likely volatile)
+                risk_score = min(1.0, max(0.0, (apy_pct - 30) / 100)) if apy_pct > 30 else 0.0
+                tvl_bonus = min(0.2, tvl / 10_000_000 * 0.2)
+                risk_score = max(0.0, risk_score - tvl_bonus)
+
+                vaults.append(Vault(
+                    address=address, name=name, token=token_label,
+                    apy_7d=apy_pct, tvl_usd=tvl, utilization=0.0,
+                    risk_score=risk_score, vault_type="strategy",
+                ))
+            except Exception:
+                continue
     except Exception as e:
-        log.warning(f"Kamino API fetch failed: {e}")
-        return []
+        log.warning(f"Kamino strategies fetch failed: {e}")
 
-    vaults = []
-    for item in raw:
+    # ─── Source 2: Lending reserves (klend) — scan all markets ──────────
+    for market_addr in KAMINO_MARKETS:
         try:
-            token = item.get("tokenSymbol", "")
-            if token not in SAFE_TOKENS:
-                continue
+            r = await client.get(
+                f"{KAMINO_API}/kamino-market/{market_addr}/reserves/metrics",
+                timeout=20,
+            )
+            r.raise_for_status()
+            raw = r.json()
 
-            apy_7d     = float(item.get("apy", {}).get("7d", 0)) * 100
-            tvl        = float(item.get("totalValueLocked", 0))
-            util       = float(item.get("utilizationRate", 0))
-            address    = item.get("strategy", "")
-            name       = item.get("strategyName", token)
+            for item in raw:
+                try:
+                    token = (item.get("liquidityToken") or "").upper()
+                    if token not in SAFE_TOKENS:
+                        continue
 
-            if tvl < 50_000:
-                continue
-            if apy_7d <= 0:
-                continue
+                    supply_apy = float(item.get("supplyApy") or 0)
+                    if supply_apy <= 0:
+                        continue
 
-            util_penalty = max(0, (util - 0.85) * 3)
-            tvl_bonus    = min(0.3, tvl / 10_000_000 * 0.3)
-            risk_score   = max(0.0, min(1.0, util_penalty - tvl_bonus))
+                    apy_pct = supply_apy * 100 if supply_apy < 1 else supply_apy
+                    tvl = float(item.get("totalSupplyUsd") or 0)
+                    if tvl < 10_000:
+                        continue
 
-            vaults.append(Vault(
-                address=address,
-                name=name,
-                token=token,
-                apy_7d=apy_7d,
-                tvl_usd=tvl,
-                utilization=util,
-                risk_score=risk_score,
-            ))
-        except Exception:
-            continue
+                    total_borrow = float(item.get("totalBorrowUsd") or item.get("totalBorrow") or 0)
+                    util = total_borrow / tvl if tvl > 0 else 0
 
+                    address = item.get("reserve", "")
+                    name = f"{item.get('liquidityToken', token)} lending"
+
+                    util_penalty = max(0, (util - 0.85) * 3)
+                    tvl_bonus = min(0.3, tvl / 10_000_000 * 0.3)
+                    risk_score = max(0.0, min(1.0, util_penalty - tvl_bonus))
+
+                    vaults.append(Vault(
+                        address=address, name=name, token=item.get("liquidityToken", token),
+                        apy_7d=apy_pct, tvl_usd=tvl, utilization=util,
+                        risk_score=risk_score, vault_type="reserve",
+                        market=market_addr,
+                    ))
+                except Exception:
+                    continue
+        except Exception as e:
+            log.warning(f"Kamino market {market_addr[:12]}... fetch failed: {e}")
+
+    # Sort by risk-adjusted APY
     vaults.sort(key=lambda v: v.apy_7d * (1 - v.risk_score), reverse=True)
+    log.info(f"Found {len(vaults)} vaults ({sum(1 for v in vaults if v.vault_type == 'strategy')} strategies, {sum(1 for v in vaults if v.vault_type == 'reserve')} reserves)")
     return vaults
 
 
@@ -519,9 +612,10 @@ async def telegram_alert(client: httpx.AsyncClient, message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
+        chat_id = int(TELEGRAM_CHAT_ID) if TELEGRAM_CHAT_ID.isdigit() else TELEGRAM_CHAT_ID
         await client.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🔁 REAPER\n{message}", "parse_mode": "HTML"},
+            json={"chat_id": chat_id, "text": f"🔁 REAPER\n{message}", "parse_mode": "HTML"},
             timeout=10
         )
     except Exception as e:
@@ -540,7 +634,10 @@ def load_state() -> State:
         try:
             with open(STATE_FILE) as f:
                 data = json.load(f)
-            return State(**data)
+            # Only pass fields that State expects
+            valid = {f.name for f in State.__dataclass_fields__.values()}
+            filtered = {k: v for k, v in data.items() if k in valid}
+            return State(**filtered)
         except Exception:
             pass
     return State()
@@ -592,8 +689,21 @@ async def run():
                     continue
 
                 best = vaults[0]
-                log.info(f"Best vault: {best.name} | APY: {best.apy_7d:.2f}% | TVL: ${best.tvl_usd:,.0f} | Util: {best.utilization*100:.1f}%")
-                log.info(f"Top 3: {[(v.name, f'{v.apy_7d:.1f}%') for v in vaults[:3]]}")
+                log.info(f"Best overall: {best.name} | APY: {best.apy_7d:.2f}% | TVL: ${best.tvl_usd:,.0f} | Type: {best.vault_type}")
+                log.info(f"Top 3: {[(v.name, f'{v.apy_7d:.1f}%', v.vault_type) for v in vaults[:3]]}")
+
+                # In auto mode, find the best SOL reserve we can actually deposit into
+                # (user holds SOL — can only deposit into SOL-denominated reserves)
+                SOL_TOKENS = {"SOL", "WSOL"}
+                best_reserve = next(
+                    (v for v in vaults if v.vault_type == "reserve" and v.token.upper() in SOL_TOKENS),
+                    None,
+                )
+                if can_execute and best_reserve:
+                    log.info(f"Best auto-executable (SOL): {best_reserve.name} | APY: {best_reserve.apy_7d:.2f}% | Market: {best_reserve.market[:12]}...")
+                    best = best_reserve
+                elif can_execute:
+                    log.warning("No SOL lending reserves found with positive APY. Monitoring only this cycle.")
 
                 # 2. Fetch current position value
                 position = await fetch_wallet_position(client, state.current_vault or best.address)
@@ -604,15 +714,25 @@ async def run():
                 current_apy = state.current_apy or 0.0
                 do_migrate, reason = should_migrate(current_apy, best.apy_7d, position)
 
+                def _update_state_vault(s: State, v: Vault):
+                    s.current_vault = v.address
+                    s.current_vault_type = v.vault_type
+                    s.current_vault_market = v.market
+                    s.current_vault_name = v.name
+                    s.current_apy = v.apy_7d
+
+                # Can only auto-execute on klend reserves (single-sided deposit)
+                # Strategies need 2 tokens — monitor only
+                can_auto_this = can_execute and best.vault_type == "reserve"
+
                 if state.current_vault is None:
                     # ─── FIRST RUN ────────────────────────────────────────
-                    log.info(f"Initial deployment → {best.name} at {best.apy_7d:.2f}% APY")
+                    log.info(f"Initial deployment → {best.name} ({best.vault_type}) at {best.apy_7d:.2f}% APY")
 
-                    if can_execute:
-                        success = await execute_initial_deposit(client, best.address)
+                    if can_auto_this:
+                        success = await execute_initial_deposit(client, best)
                         if success:
-                            state.current_vault = best.address
-                            state.current_apy = best.apy_7d
+                            _update_state_vault(state, best)
                             await telegram_alert(client,
                                 f"AUTO: Initial deposit complete!\n"
                                 f"Vault: <b>{best.name}</b> @ {best.apy_7d:.2f}% APY\n"
@@ -623,28 +743,31 @@ async def run():
                             await telegram_alert(client, "Initial deposit failed. Retrying next cycle.")
                     else:
                         log.info(f"ACTION REQUIRED: Deposit into vault {best.address}")
-                        log.info(f"Kamino: https://app.kamino.finance/lending/reserve/{best.address}")
-                        state.current_vault = best.address
-                        state.current_apy = best.apy_7d
+                        _update_state_vault(state, best)
                         await telegram_alert(client,
                             f"Initial vault selected:\n<b>{best.name}</b> @ {best.apy_7d:.2f}% APY\n"
-                            f"Deposit here:\nhttps://app.kamino.finance/lending/reserve/{best.address}"
+                            f"Deposit here:\nhttps://app.kamino.finance"
                         )
 
                 elif do_migrate:
                     # ─── MIGRATION ────────────────────────────────────────
                     log.info(f"MIGRATE: {reason}")
-                    log.info(f"  From: {state.current_vault} @ {current_apy:.2f}%")
-                    log.info(f"  To:   {best.address} ({best.name}) @ {best.apy_7d:.2f}%")
+                    log.info(f"  From: {state.current_vault_name} @ {current_apy:.2f}%")
+                    log.info(f"  To:   {best.name} @ {best.apy_7d:.2f}%")
 
-                    if can_execute:
-                        balance_lamports = await get_sol_balance(client)
-                        success = await execute_migration(
-                            client, state.current_vault, best.address, balance_lamports
+                    if can_auto_this:
+                        # Reconstruct current vault object from state
+                        current_v = Vault(
+                            address=state.current_vault,
+                            name=state.current_vault_name,
+                            token="", apy_7d=current_apy, tvl_usd=0,
+                            utilization=0, risk_score=0,
+                            vault_type=state.current_vault_type,
+                            market=state.current_vault_market,
                         )
+                        success = await execute_migration(client, current_v, best)
                         if success:
-                            state.current_vault = best.address
-                            state.current_apy = best.apy_7d
+                            _update_state_vault(state, best)
                             state.migrations += 1
                             projection = compute_compound_projection(position, best.apy_7d, 365)
                             await telegram_alert(client,
@@ -660,8 +783,7 @@ async def run():
                                 f"Target was: {best.name} @ {best.apy_7d:.2f}%"
                             )
                     else:
-                        state.current_vault = best.address
-                        state.current_apy = best.apy_7d
+                        _update_state_vault(state, best)
                         state.migrations += 1
                         projection = compute_compound_projection(position, best.apy_7d, 365)
                         await telegram_alert(client,
