@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kamino Yield Reaper — Dashboard Preview</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #0d0d1c;
+    color: #c8c8dc;
+    font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+    font-size: 14px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    padding: 24px;
+  }
+
+  .terminal {
+    background: linear-gradient(180deg, #0f0f24 0%, #0a0a1a 100%);
+    border: 1px solid #1a1a3a;
+    border-radius: 16px;
+    width: 100%;
+    max-width: 620px;
+    padding: 0;
+    box-shadow:
+      0 0 60px rgba(0, 255, 180, 0.04),
+      0 20px 60px rgba(0, 0, 0, 0.5),
+      inset 0 1px 0 rgba(255,255,255,0.03);
+    overflow: hidden;
+  }
+
+  .titlebar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 24px;
+    border-bottom: 1px solid #1a1a3a;
+    background: rgba(255,255,255,0.01);
+  }
+
+  .titlebar .dots {
+    display: flex;
+    gap: 8px;
+  }
+  .titlebar .dot {
+    width: 12px; height: 12px;
+    border-radius: 50%;
+  }
+  .dot.red { background: #ff5f57; }
+  .dot.yellow { background: #febc2e; }
+  .dot.green { background: #28c840; }
+
+  .titlebar h1 {
+    font-size: 13px;
+    font-weight: 500;
+    color: #5050a0;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+  }
+
+  .status-badge {
+    font-size: 11px;
+    font-weight: 700;
+    color: #00ffb4;
+    background: rgba(0,255,180,0.08);
+    border: 1px solid rgba(0,255,180,0.2);
+    padding: 4px 12px;
+    border-radius: 20px;
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+  }
+
+  .content {
+    padding: 24px;
+  }
+
+  .card-row {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 20px;
+  }
+
+  .card {
+    flex: 1;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid #1a1a3a;
+    border-radius: 12px;
+    padding: 16px 20px;
+  }
+
+  .card-label {
+    font-size: 10px;
+    font-weight: 500;
+    color: #5050a0;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+
+  .card-value {
+    font-size: 28px;
+    font-weight: 700;
+    color: #e8e8f0;
+  }
+
+  .card-value.accent {
+    color: #00ffb4;
+  }
+
+  .spark-bar {
+    margin-top: 10px;
+    height: 4px;
+    background: #1a1a3a;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .spark-fill {
+    height: 100%;
+    width: 62%;
+    background: linear-gradient(90deg, #00ffb4, #64a0ff);
+    border-radius: 2px;
+    transition: width 1s ease;
+  }
+
+  .vault-row {
+    margin-bottom: 20px;
+  }
+  .vault-addr {
+    font-size: 12px;
+    color: #3a3a60;
+    margin-top: 4px;
+    font-family: monospace;
+  }
+
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-bottom: 20px;
+    padding: 16px 20px;
+    background: rgba(255,255,255,0.015);
+    border: 1px solid #1a1a3a;
+    border-radius: 12px;
+  }
+
+  .stat .stat-label {
+    font-size: 9px;
+    color: #5050a0;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+  }
+  .stat .stat-value {
+    font-size: 15px;
+    font-weight: 600;
+    color: #c8c8dc;
+  }
+  .stat .stat-value.green { color: #00e68c; }
+
+  .section-title {
+    font-size: 11px;
+    font-weight: 700;
+    color: #6490ff;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    margin-bottom: 12px;
+    margin-top: 4px;
+  }
+
+  .divider {
+    border: none;
+    border-top: 1px solid #1a1a3a;
+    margin: 20px 0;
+  }
+
+  .projections {
+    margin-bottom: 4px;
+  }
+
+  .proj-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.02);
+  }
+  .proj-row:last-child { border: none; }
+
+  .proj-period {
+    color: #5050a0;
+    font-size: 12px;
+    font-weight: 500;
+    min-width: 40px;
+  }
+  .proj-value {
+    color: #c8c8dc;
+    font-size: 14px;
+    font-weight: 500;
+  }
+  .proj-gain {
+    color: #00e68c;
+    font-size: 13px;
+    font-weight: 600;
+    text-align: right;
+  }
+
+  .log-section {
+    background: rgba(0,0,0,0.25);
+    border: 1px solid #1a1a3a;
+    border-radius: 12px;
+    padding: 16px;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+
+  .log-line {
+    font-size: 11px;
+    line-height: 1.7;
+    color: #3a3a60;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .log-line.info { color: #4a4a70; }
+  .log-line.migrate { color: #00ffb4; font-weight: 600; }
+  .log-line.best { color: #6490ff; }
+  .log-line.hold { color: #ffc83c; }
+
+  .footer {
+    text-align: center;
+    padding: 16px;
+    font-size: 11px;
+    color: #2a2a50;
+    font-style: italic;
+    border-top: 1px solid #1a1a3a;
+  }
+
+  .label-hint {
+    font-size: 10px;
+    color: #3a3a60;
+    margin-top: 2px;
+  }
+</style>
+</head>
+<body>
+
+<div class="terminal">
+  <div class="titlebar">
+    <div class="dots">
+      <div class="dot red"></div>
+      <div class="dot yellow"></div>
+      <div class="dot green"></div>
+    </div>
+    <h1>Kamino Yield Reaper</h1>
+    <div class="status-badge">LIVE</div>
+  </div>
+
+  <div class="content">
+    <!-- Position & APY -->
+    <div class="card-row">
+      <div class="card">
+        <div class="card-label">Position</div>
+        <div class="card-value">$17.38</div>
+        <div class="label-hint">SOL balance</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Current APY</div>
+        <div class="card-value accent">12.47%</div>
+        <div class="spark-bar"><div class="spark-fill"></div></div>
+      </div>
+    </div>
+
+    <!-- Vault -->
+    <div class="vault-row">
+      <div class="card-label">Active Vault</div>
+      <div class="vault-addr">7u3HeHwcRmqfkZMeBPVmDJSUQRnGZtPa2xVYqs4Fn2Jv</div>
+    </div>
+
+    <!-- Stats -->
+    <div class="stats-grid">
+      <div class="stat">
+        <div class="stat-label">Migrations</div>
+        <div class="stat-value">2</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Earned</div>
+        <div class="stat-value green">$0.38</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Uptime</div>
+        <div class="stat-value">366d 11h</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Last Check</div>
+        <div class="stat-value green">3s ago</div>
+      </div>
+    </div>
+
+    <hr class="divider">
+
+    <!-- Projections -->
+    <div class="section-title">Compound Projections</div>
+    <div class="projections">
+      <div class="proj-row">
+        <span class="proj-period">7d</span>
+        <span class="proj-value">$17.4258</span>
+        <span class="proj-gain">+$0.0416</span>
+      </div>
+      <div class="proj-row">
+        <span class="proj-period">30d</span>
+        <span class="proj-value">$17.5633</span>
+        <span class="proj-gain">+$0.1791</span>
+      </div>
+      <div class="proj-row">
+        <span class="proj-period">1yr</span>
+        <span class="proj-value">$19.6926</span>
+        <span class="proj-gain">+$2.3084</span>
+      </div>
+    </div>
+
+    <hr class="divider">
+
+    <!-- Log -->
+    <div class="section-title">Recent Log</div>
+    <div class="log-section">
+      <div class="log-line best">03:34:13 Best vault: jitoSOL-Reserve | APY: 12.47% | TVL: $4,280,000</div>
+      <div class="log-line info">03:34:13 Top 3: jitoSOL 12.5% / mSOL 11.2% / SOL 9.8%</div>
+      <div class="log-line info">03:34:14 Position: $17.3842 | Vault: 7u3HeHwcRm...</div>
+      <div class="log-line migrate">03:34:14 MIGRATE SIGNAL: Delta 2.31% APY, recoup in 3.2 days</div>
+      <div class="log-line info">03:34:14 Projection: 30d=$17.56 | 1yr=$19.52 | APY=12.47%</div>
+      <div class="log-line info">03:34:14 Cycle complete in 1.8s. Sleeping 298s.</div>
+      <div class="log-line best">03:39:14 Best vault: jitoSOL-Reserve | APY: 12.47% | TVL: $4,280,000</div>
+      <div class="log-line hold">03:39:14 HOLD: APY delta 0.12% below threshold 1.5%</div>
+    </div>
+  </div>
+
+  <div class="footer">refreshing every 10s &middot; ctrl+c to exit</div>
+</div>
+
+</body>
+</html>
